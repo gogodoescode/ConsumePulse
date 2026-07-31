@@ -1,7 +1,13 @@
 {
   "name": "consumepulse-consumer",
   "version": "0.1.0",
+  "builtin-baseline": "3c5d90a305ff00ca841f085a74a7ce74ee777dee",
   "dependencies": [
-    "librdkafka"
+    "librdkafka",
+    "nlohmann-json",
+    "libpqxx"
+  ],
+  "overrides": [
+    { "name": "libpqxx", "version": "7.10.5" }
   ]
 }

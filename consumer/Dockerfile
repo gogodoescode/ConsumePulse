@@ -2,9 +2,10 @@ FROM debian:bookworm-slim AS build
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
     build-essential cmake curl zip unzip tar git pkg-config ca-certificates ninja-build \
+    python3 bison flex perl \
     && rm -rf /var/lib/apt/lists/*
 
-RUN git clone --depth 1 https://github.com/microsoft/vcpkg.git /opt/vcpkg \
+RUN git clone --filter=blob:none https://github.com/microsoft/vcpkg.git /opt/vcpkg \
     && /opt/vcpkg/bootstrap-vcpkg.sh -disableMetrics
 
 WORKDIR /src

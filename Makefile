@@ -1,4 +1,4 @@
-.PHONY: up down logs psql topic-test producer consumer query
+.PHONY: up down logs psql topic-test producer consumer consumer-build events query
 
 up:
 	docker compose up -d
@@ -18,8 +18,14 @@ topic-test:
 producer:
 	python3 producer/simulate_devices.py
 
+consumer-build:
+	docker compose --profile consumer build consumer
+
 consumer:
-	./consumer/build/consumer
+	docker compose --profile consumer run --rm consumer
+
+events:
+	docker exec -it consumepulse-postgres psql -U consumepulse -d consumepulse -c "SELECT * FROM events ORDER BY ingested_at DESC LIMIT 20;"
 
 query:
 	docker exec -it consumepulse-postgres psql -U consumepulse -d consumepulse -c "SELECT * FROM alerts ORDER BY created_at DESC LIMIT 20;"

@@ -79,3 +79,39 @@ to `localhost:9092`). Not started by `docker compose up` by default — it's
 behind the `consumer` profile.
 
 Verify: printed output matches what `simulate_devices.py` sent.
+
+## Phase 3 — Parsing + Repository
+
+Each Kafka message is parsed into an `Event` struct and persisted via
+`PostgresEventRepository::save()`. Idempotent: `event_id` has a UNIQUE
+constraint, and `save()` does `INSERT ... ON CONFLICT (event_id) DO NOTHING`,
+so redelivery of the same message never creates a duplicate row. The device
+carried in each event (`device_id` + `device_type`) is upserted into
+`devices` first, satisfying the FK on `events.device_id` — there's no
+separate seeding step.
+
+Rebuild (adds `nlohmann-json` + `libpqxx` to the vcpkg manifest):
+
+```
+cmake -S consumer -B consumer/build -DCMAKE_TOOLCHAIN_FILE=%VCPKG_ROOT%/scripts/buildsystems/vcpkg.cmake
+cmake --build consumer/build --config Release
+```
+
+or via Docker: `docker compose --profile consumer run --rm consumer`
+(`PG_CONN_STRING` env var, defaults to `postgresql://consumepulse:consumepulse@localhost:5432/consumepulse`
+natively, wired to the `postgres` service in compose).
+
+Verify:
+
+```
+make events
+```
+
+To prove idempotency, redeliver everything and confirm row count doesn't move:
+
+```
+docker exec -it consumepulse-kafka /opt/kafka/bin/kafka-consumer-groups.sh --bootstrap-server localhost:9092 --group telemetry-processors --reset-offsets --to-earliest --topic device-events --execute
+```
+
+then rerun the consumer and re-check `SELECT count(*) FROM events` — same
+number as before, and `count(*) = count(DISTINCT event_id)`.

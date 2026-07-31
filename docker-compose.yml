@@ -57,8 +57,11 @@ services:
     depends_on:
       kafka:
         condition: service_healthy
+      postgres:
+        condition: service_healthy
     environment:
       KAFKA_BOOTSTRAP_SERVERS: kafka:29092
+      PG_CONN_STRING: postgresql://consumepulse:consumepulse@postgres:5432/consumepulse
     profiles: ["consumer"]
 
 volumes:

@@ -5,20 +5,48 @@
 #include <string>
 
 #include <librdkafka/rdkafkacpp.h>
+#include <nlohmann/json.hpp>
+#include <pqxx/pqxx>
+
+#include "models.hpp"
+#include "repository.hpp"
 
 namespace {
 volatile sig_atomic_t running = 1;
 void handleSignal(int) { running = 0; }
+
+std::string envOr(const char* name, const std::string& fallback) {
+    const char* value = std::getenv(name);
+    return value ? value : fallback;
+}
+
+Event parseEvent(const std::string& payload) {
+    nlohmann::json j = nlohmann::json::parse(payload);
+    Event event;
+    event.event_id = j.at("event_id").get<std::string>();
+    event.device_id = j.at("device_id").get<std::string>();
+    event.device_type = j.at("device_type").get<std::string>();
+    event.metric = j.at("metric").get<std::string>();
+    event.value = j.at("value").get<double>();
+    event.unit = j.value("unit", "");
+    event.event_timestamp = j.at("event_timestamp").get<std::string>();
+    return event;
+}
 }  // namespace
 
 int main() {
+    std::cout << std::unitbuf;
+    std::cerr << std::unitbuf;
     std::signal(SIGINT, handleSignal);
     std::signal(SIGTERM, handleSignal);
 
     std::string errstr;
+    std::string bootstrapServers = envOr("KAFKA_BOOTSTRAP_SERVERS", "localhost:9092");
+    std::string pgConnString = envOr(
+        "PG_CONN_STRING", "postgresql://consumepulse:consumepulse@localhost:5432/consumepulse");
 
-    const char* bootstrapServersEnv = std::getenv("KAFKA_BOOTSTRAP_SERVERS");
-    std::string bootstrapServers = bootstrapServersEnv ? bootstrapServersEnv : "localhost:9092";
+    pqxx::connection conn(pgConnString);
+    PostgresEventRepository eventRepository(conn);
 
     std::unique_ptr<RdKafka::Conf> conf(RdKafka::Conf::create(RdKafka::Conf::CONF_GLOBAL));
     conf->set("bootstrap.servers", bootstrapServers, errstr);
@@ -45,10 +73,18 @@ int main() {
             case RdKafka::ERR__TIMED_OUT:
                 break;
             case RdKafka::ERR_NO_ERROR: {
-                std::string key = msg->key() ? *msg->key() : "";
                 std::string payload(static_cast<const char*>(msg->payload()), msg->len());
-                std::cout << "[partition " << msg->partition() << " offset " << msg->offset()
-                          << "] key=" << key << " value=" << payload << "\n";
+                try {
+                    Event event = parseEvent(payload);
+                    eventRepository.save(event);
+                    std::cout << "[partition " << msg->partition() << " offset " << msg->offset()
+                              << "] saved event_id=" << event.event_id
+                              << " device=" << event.device_id << " metric=" << event.metric
+                              << " value=" << event.value << "\n";
+                } catch (const std::exception& e) {
+                    std::cerr << "[partition " << msg->partition() << " offset " << msg->offset()
+                              << "] skipped malformed message: " << e.what() << "\n";
+                }
                 break;
             }
             default:
