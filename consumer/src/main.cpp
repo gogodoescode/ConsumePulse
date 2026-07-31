@@ -8,6 +8,7 @@
 #include <nlohmann/json.hpp>
 #include <pqxx/pqxx>
 
+#include "alert_observer.hpp"
 #include "device_factory.hpp"
 #include "models.hpp"
 #include "repository.hpp"
@@ -48,6 +49,13 @@ int main() {
 
     pqxx::connection conn(pgConnString);
     PostgresEventRepository eventRepository(conn);
+    PostgresAlertRepository alertRepository(conn);
+
+    ConsoleAlertObserver consoleObserver;
+    DbAlertObserver dbObserver(alertRepository);
+    AlertPublisher alertPublisher;
+    alertPublisher.attach(&consoleObserver);
+    alertPublisher.attach(&dbObserver);
 
     std::unique_ptr<RdKafka::Conf> conf(RdKafka::Conf::create(RdKafka::Conf::CONF_GLOBAL));
     conf->set("bootstrap.servers", bootstrapServers, errstr);
@@ -88,9 +96,7 @@ int main() {
                         handler ? handler->strategyFor(event.metric) : nullptr;
                     if (strategy) {
                         if (auto alert = strategy->evaluate(event)) {
-                            std::cout << "[ALERT] " << alert->severity << " " << alert->rule_name
-                                      << " device=" << alert->device_id << ": " << alert->message
-                                      << "\n";
+                            alertPublisher.notify(*alert);
                         }
                     }
                 } catch (const std::exception& e) {

@@ -39,3 +39,28 @@ public:
 private:
     pqxx::connection& conn_;
 };
+
+class IAlertRepository {
+public:
+    virtual ~IAlertRepository() = default;
+    virtual void save(const Alert& alert) = 0;
+};
+
+class PostgresAlertRepository : public IAlertRepository {
+public:
+    explicit PostgresAlertRepository(pqxx::connection& conn) : conn_(conn) {}
+
+    void save(const Alert& alert) override {
+        pqxx::work txn(conn_);
+
+        txn.exec_params(
+            "INSERT INTO alerts (event_id, device_id, rule_name, severity, message) "
+            "VALUES ($1, $2, $3, $4, $5)",
+            alert.event_id, alert.device_id, alert.rule_name, alert.severity, alert.message);
+
+        txn.commit();
+    }
+
+private:
+    pqxx::connection& conn_;
+};

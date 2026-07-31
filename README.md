@@ -141,3 +141,20 @@ Verify: with the producer running, watch consumer output for lines like
 ```
 [ALERT] critical threshold device=app-server-1: cpu_temp=98 outside expected range [40, 75] for device app-server-1
 ```
+
+## Phase 5 — Observer + alert persistence
+
+`AlertPublisher` fans an alert out to attached `IAlertObserver`s —
+`ConsoleAlertObserver` (the `[ALERT]` log line) and `DbAlertObserver`
+(`PostgresAlertRepository::save()`, writing to the `alerts` table). Detection
+in `ThresholdStrategy` doesn't know or care who's listening.
+
+Rebuild and run the same way as Phase 3/4.
+
+Verify: with the producer running, watch for `[ALERT]` lines, then
+
+```
+make query
+```
+
+and confirm the rows match what was logged.
