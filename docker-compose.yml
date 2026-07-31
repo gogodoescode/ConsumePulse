@@ -50,5 +50,16 @@ services:
       timeout: 5s
       retries: 10
 
+  consumer:
+    build:
+      context: ./consumer
+    container_name: consumepulse-consumer
+    depends_on:
+      kafka:
+        condition: service_healthy
+    environment:
+      KAFKA_BOOTSTRAP_SERVERS: kafka:29092
+    profiles: ["consumer"]
+
 volumes:
   pgdata:
