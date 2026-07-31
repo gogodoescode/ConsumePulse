@@ -1,0 +1,7 @@
+consumer/build/
+consumer/vcpkg_installed/
+producer/__pycache__/
+producer/venv/
+*.pyc
+.vscode/
+ConsumePulse_Build_Guide.md
