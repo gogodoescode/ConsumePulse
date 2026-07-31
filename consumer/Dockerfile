@@ -9,7 +9,13 @@ RUN git clone --filter=blob:none https://github.com/microsoft/vcpkg.git /opt/vcp
     && /opt/vcpkg/bootstrap-vcpkg.sh -disableMetrics
 
 WORKDIR /src
-COPY vcpkg.json CMakeLists.txt ./
+
+# Dependencies first, in their own layer, so editing src/ later doesn't
+# trigger a from-source rebuild of librdkafka/libpqxx/etc via vcpkg.
+COPY vcpkg.json ./
+RUN /opt/vcpkg/vcpkg install
+
+COPY CMakeLists.txt ./
 COPY src ./src
 
 RUN cmake -S . -B build -G Ninja \

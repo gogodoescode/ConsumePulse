@@ -8,6 +8,7 @@
 #include <nlohmann/json.hpp>
 #include <pqxx/pqxx>
 
+#include "device_factory.hpp"
 #include "models.hpp"
 #include "repository.hpp"
 
@@ -81,6 +82,17 @@ int main() {
                               << "] saved event_id=" << event.event_id
                               << " device=" << event.device_id << " metric=" << event.metric
                               << " value=" << event.value << "\n";
+
+                    auto handler = DeviceHandlerFactory::create(event.device_type);
+                    const IAnomalyStrategy* strategy =
+                        handler ? handler->strategyFor(event.metric) : nullptr;
+                    if (strategy) {
+                        if (auto alert = strategy->evaluate(event)) {
+                            std::cout << "[ALERT] " << alert->severity << " " << alert->rule_name
+                                      << " device=" << alert->device_id << ": " << alert->message
+                                      << "\n";
+                        }
+                    }
                 } catch (const std::exception& e) {
                     std::cerr << "[partition " << msg->partition() << " offset " << msg->offset()
                               << "] skipped malformed message: " << e.what() << "\n";

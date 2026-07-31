@@ -115,3 +115,29 @@ docker exec -it consumepulse-kafka /opt/kafka/bin/kafka-consumer-groups.sh --boo
 
 then rerun the consumer and re-check `SELECT count(*) FROM events` — same
 number as before, and `count(*) = count(DISTINCT event_id)`.
+
+## Phase 4 — Factory + Strategy
+
+`DeviceHandlerFactory::create(device_type)` returns a handler
+(`AppServerHandler` / `SensorHubHandler`) that owns a `ThresholdStrategy` per
+metric. Ranges match the producer's normal random-walk range exactly, so the
+producer's occasional spikes are guaranteed to trip a threshold:
+
+| device type  | metric         | range      |
+|--------------|----------------|------------|
+| app-server   | `cpu_temp`     | 40 – 75    |
+| app-server   | `latency_ms`   | 20 – 150   |
+| sensor-hub   | `cpu_temp`     | 20 – 45    |
+| sensor-hub   | `humidity_pct` | 30 – 70    |
+
+No persistence yet — an out-of-range reading just logs an `[ALERT]` line.
+Phase 5 adds the Observer pattern and writes it to the `alerts` table.
+
+Rebuild and run the same way as Phase 3 (`make consumer-build` /
+`make consumer`, or the native CMake commands above).
+
+Verify: with the producer running, watch consumer output for lines like
+
+```
+[ALERT] critical threshold device=app-server-1: cpu_temp=98 outside expected range [40, 75] for device app-server-1
+```
