@@ -158,3 +158,47 @@ make query
 ```
 
 and confirm the rows match what was logged.
+
+## Phase 6 — Commit discipline + error handling
+
+`enable.auto.commit` is now `false`. The offset for a message is committed
+(`consumer->commitSync(msg.get())`) only after its event has been saved and
+any alert published — never before. Two failure modes are handled
+differently:
+
+- **Malformed JSON** (poison pill): logged and the offset is committed
+  anyway — retrying a message that will never parse doesn't help, and this
+  keeps one bad message from blocking the partition forever.
+- **DB write failure** (connection drop, Postgres restart): logged, offset
+  left uncommitted, connection rebuilt, and the *same* message retried in a
+  loop (with a 2s backoff) until it succeeds. The consumer never advances
+  past a message it couldn't persist.
+
+Verify: start the producer and consumer, then kill the DB mid-run and watch
+it recover.
+
+```
+docker stop consumepulse-postgres
+```
+
+Consumer logs show `DB write failed, offset not committed, retrying`
+repeatedly, and
+
+```
+docker exec -it consumepulse-kafka /opt/kafka/bin/kafka-consumer-groups.sh --bootstrap-server localhost:9092 --group telemetry-processors --describe
+```
+
+shows `CURRENT-OFFSET` frozen while `LOG-END-OFFSET`/`LAG` keep climbing.
+Then:
+
+```
+docker start consumepulse-postgres
+```
+
+and the consumer catches back up to zero lag with no message skipped or
+duplicated.
+
+**Known tradeoff:** while stuck retrying a single message, the consumer
+isn't calling `consume()`, so a DB outage long enough to exceed
+`session.timeout.ms` could trigger a group rebalance. Fine for a demo-scale
+outage; a production version would heartbeat manually during long retries.

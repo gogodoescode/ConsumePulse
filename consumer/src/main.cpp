@@ -1,8 +1,10 @@
+#include <chrono>
 #include <csignal>
 #include <cstdlib>
 #include <iostream>
 #include <memory>
 #include <string>
+#include <thread>
 
 #include <librdkafka/rdkafkacpp.h>
 #include <nlohmann/json.hpp>
@@ -34,6 +36,20 @@ Event parseEvent(const std::string& payload) {
     event.event_timestamp = j.at("event_timestamp").get<std::string>();
     return event;
 }
+
+// Blocks until a connection is established. DB downtime should stall
+// processing, not crash the consumer.
+std::unique_ptr<pqxx::connection> connectWithRetry(const std::string& connString) {
+    while (running) {
+        try {
+            return std::make_unique<pqxx::connection>(connString);
+        } catch (const std::exception& e) {
+            std::cerr << "Failed to connect to Postgres, retrying in 2s: " << e.what() << "\n";
+            std::this_thread::sleep_for(std::chrono::seconds(2));
+        }
+    }
+    return nullptr;
+}
 }  // namespace
 
 int main() {
@@ -47,20 +63,16 @@ int main() {
     std::string pgConnString = envOr(
         "PG_CONN_STRING", "postgresql://consumepulse:consumepulse@localhost:5432/consumepulse");
 
-    pqxx::connection conn(pgConnString);
-    PostgresEventRepository eventRepository(conn);
-    PostgresAlertRepository alertRepository(conn);
-
-    ConsoleAlertObserver consoleObserver;
-    DbAlertObserver dbObserver(alertRepository);
-    AlertPublisher alertPublisher;
-    alertPublisher.attach(&consoleObserver);
-    alertPublisher.attach(&dbObserver);
+    std::unique_ptr<pqxx::connection> conn = connectWithRetry(pgConnString);
+    if (!conn) {
+        return 1;  // only happens if a signal interrupted startup
+    }
 
     std::unique_ptr<RdKafka::Conf> conf(RdKafka::Conf::create(RdKafka::Conf::CONF_GLOBAL));
     conf->set("bootstrap.servers", bootstrapServers, errstr);
     conf->set("group.id", "telemetry-processors", errstr);
     conf->set("auto.offset.reset", "earliest", errstr);
+    conf->set("enable.auto.commit", "false", errstr);
 
     std::unique_ptr<RdKafka::KafkaConsumer> consumer(RdKafka::KafkaConsumer::create(conf.get(), errstr));
     if (!consumer) {
@@ -83,25 +95,58 @@ int main() {
                 break;
             case RdKafka::ERR_NO_ERROR: {
                 std::string payload(static_cast<const char*>(msg->payload()), msg->len());
-                try {
-                    Event event = parseEvent(payload);
-                    eventRepository.save(event);
-                    std::cout << "[partition " << msg->partition() << " offset " << msg->offset()
-                              << "] saved event_id=" << event.event_id
-                              << " device=" << event.device_id << " metric=" << event.metric
-                              << " value=" << event.value << "\n";
 
-                    auto handler = DeviceHandlerFactory::create(event.device_type);
-                    const IAnomalyStrategy* strategy =
-                        handler ? handler->strategyFor(event.metric) : nullptr;
-                    if (strategy) {
-                        if (auto alert = strategy->evaluate(event)) {
-                            alertPublisher.notify(*alert);
-                        }
-                    }
+                Event event;
+                try {
+                    event = parseEvent(payload);
                 } catch (const std::exception& e) {
+                    // A poison pill will never parse no matter how often we
+                    // retry it, so log, commit past it, and move on.
                     std::cerr << "[partition " << msg->partition() << " offset " << msg->offset()
-                              << "] skipped malformed message: " << e.what() << "\n";
+                              << "] skipping malformed message: " << e.what() << "\n";
+                    consumer->commitSync(msg.get());
+                    break;
+                }
+
+                // A DB write failure is presumed transient (connection
+                // drop, restart): retry the same message against a fresh
+                // connection until it succeeds. The offset is only
+                // committed on success, so a crash or restart mid-outage
+                // redelivers this message instead of silently losing it.
+                bool committed = false;
+                while (!committed && running) {
+                    try {
+                        PostgresEventRepository eventRepository(*conn);
+                        PostgresAlertRepository alertRepository(*conn);
+                        ConsoleAlertObserver consoleObserver;
+                        DbAlertObserver dbObserver(alertRepository);
+                        AlertPublisher alertPublisher;
+                        alertPublisher.attach(&consoleObserver);
+                        alertPublisher.attach(&dbObserver);
+
+                        eventRepository.save(event);
+
+                        auto handler = DeviceHandlerFactory::create(event.device_type);
+                        const IAnomalyStrategy* strategy =
+                            handler ? handler->strategyFor(event.metric) : nullptr;
+                        if (strategy) {
+                            if (auto alert = strategy->evaluate(event)) {
+                                alertPublisher.notify(*alert);
+                            }
+                        }
+
+                        consumer->commitSync(msg.get());
+                        committed = true;
+                        std::cout << "[partition " << msg->partition() << " offset " << msg->offset()
+                                  << "] saved event_id=" << event.event_id
+                                  << " device=" << event.device_id << " metric=" << event.metric
+                                  << " value=" << event.value << "\n";
+                    } catch (const std::exception& e) {
+                        std::cerr << "[partition " << msg->partition() << " offset " << msg->offset()
+                                  << "] DB write failed, offset not committed, retrying: " << e.what()
+                                  << "\n";
+                        conn = connectWithRetry(pgConnString);
+                    }
                 }
                 break;
             }
