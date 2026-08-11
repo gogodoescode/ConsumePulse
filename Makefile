@@ -1,10 +1,13 @@
-.PHONY: up down logs psql topic-test producer consumer consumer-build events query
+.PHONY: up all down logs psql topic-test producer consumer consumer-build test events query
 
 up:
 	docker compose up -d
 
+all:
+	docker compose --profile all up -d
+
 down:
-	docker compose down
+	docker compose --profile all down
 
 logs:
 	docker compose logs -f
@@ -23,6 +26,9 @@ consumer-build:
 
 consumer:
 	docker compose --profile consumer run --rm consumer
+
+test:
+	docker compose --profile consumer build consumer
 
 events:
 	docker exec -it consumepulse-postgres psql -U consumepulse -d consumepulse -c "SELECT * FROM events ORDER BY ingested_at DESC LIMIT 20;"

@@ -17,11 +17,13 @@ RUN /opt/vcpkg/vcpkg install
 
 COPY CMakeLists.txt ./
 COPY src ./src
+COPY tests ./tests
 
 RUN cmake -S . -B build -G Ninja \
       -DCMAKE_TOOLCHAIN_FILE=/opt/vcpkg/scripts/buildsystems/vcpkg.cmake \
       -DCMAKE_BUILD_TYPE=Release \
-    && cmake --build build
+    && cmake --build build \
+    && ctest --test-dir build --output-on-failure
 
 FROM debian:bookworm-slim
 RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates && rm -rf /var/lib/apt/lists/*

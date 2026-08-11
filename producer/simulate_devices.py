@@ -6,6 +6,7 @@ outside range on purpose so Phase 4's ThresholdStrategy has something to
 catch.
 """
 import json
+import os
 import random
 import time
 import uuid
@@ -13,7 +14,7 @@ from datetime import datetime, timezone
 
 from confluent_kafka import Producer
 
-BOOTSTRAP_SERVERS = "localhost:9092"
+BOOTSTRAP_SERVERS = os.environ.get("KAFKA_BOOTSTRAP_SERVERS", "localhost:9092")
 TOPIC = "device-events"
 TICK_SECONDS = 1.0
 SPIKE_PROBABILITY = 0.05

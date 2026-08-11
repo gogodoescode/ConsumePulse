@@ -62,7 +62,18 @@ services:
     environment:
       KAFKA_BOOTSTRAP_SERVERS: kafka:29092
       PG_CONN_STRING: postgresql://consumepulse:consumepulse@postgres:5432/consumepulse
-    profiles: ["consumer"]
+    profiles: ["consumer", "all"]
+
+  producer:
+    build:
+      context: ./producer
+    container_name: consumepulse-producer
+    depends_on:
+      kafka-init:
+        condition: service_completed_successfully
+    environment:
+      KAFKA_BOOTSTRAP_SERVERS: kafka:29092
+    profiles: ["producer", "all"]
 
 volumes:
   pgdata:

@@ -1,204 +1,237 @@
 # ConsumePulse
 
-Distributed telemetry & alerting pipeline: Python producers simulate devices,
-stream events to Kafka, a C++ consumer processes and persists them to
-PostgreSQL, and fans out alerts via an Observer pattern.
+A telemetry pipeline I built to get hands-on with Kafka and concurrent
+systems design beyond the tutorial level: a fleet of simulated devices
+streams metrics into Kafka, a multi-threaded C++ consumer processes them
+concurrently, persists everything to Postgres, and fans out alerts when a
+reading goes out of range. The interesting part isn't the plumbing — it's
+making concurrent processing, ordering guarantees, and correct offset
+commits all work together without silently losing or duplicating data.
 
-See `ConsumePulse_Build_Guide.md` for full architecture, schema, and the
-phased build plan.
-
-## Phase 0 — Infra
-
-```
-docker compose up -d
-```
-
-Brings up Kafka (KRaft, single broker) and PostgreSQL 16. The `device-events`
-topic (3 partitions) and the `devices` / `events` / `alerts` tables are
-created automatically.
-
-Verify:
+## Architecture
 
 ```
-make topic-test   # lists Kafka topics
-make psql         # opens a psql shell against the consumepulse DB
+[Python producer]  -->  [Kafka: device-events]  -->  [poller thread]
+ 6 devices, keyed          3 partitions                parse JSON,
+ by device_id,                                         hash(device_id) % N
+ occasional spikes                                            |
+                                                                v
+                                  +---------+---------+---------+---------+
+                                  | queue 0 | queue 1 | queue 2 | queue 3 |
+                                  +---------+---------+---------+---------+
+                                       |         |         |         |
+                                       v         v         v         v
+                                   worker 0  worker 1  worker 2  worker 3
+                                   (each owns its own pqxx::connection)
+                                       |         |         |         |
+                                       +---------+----+----+---------+
+                                                      |
+                                                mark(partition, offset)
+                                                      v
+                                          OffsetTracker (contiguous-prefix
+                                          watermark, per partition)
+                                                      |
+                                          commitSync every 500ms
+                                                      v
+                                              +----------------+
+                                              |   PostgreSQL    |
+                                              | devices / events |
+                                              |     / alerts     |
+                                              +----------------+
 ```
 
-## Phase 1 — Producer
+Every event also runs through `ThresholdStrategy` (Strategy pattern, picked
+via `DeviceHandlerFactory`) inside its worker; an out-of-range reading fans
+out through `AlertPublisher` (Observer pattern) to a console log and a
+Postgres write.
 
-Simulates 6 devices (3 `app-server`, 3 `sensor-hub`), each walking 2 metrics.
-Values random-walk within a normal range; ~5% of ticks push a metric to a
-fixed out-of-range spike value on purpose, so Phase 4's threshold strategy
-has something to catch.
+## Design decisions
 
-```
-cd producer
-python -m venv venv
-./venv/Scripts/python.exe -m pip install -r requirements.txt
-./venv/Scripts/python.exe simulate_devices.py
-```
+**Keyed partitioning for per-device ordering.** The producer keys each
+message by `device_id`, so Kafka guarantees ordering within a partition.
+Kafka's ordering guarantee is per-partition, not global — the consumer has
+to respect that or the guarantee is worthless.
 
-Verify well-formed messages are landing in the topic:
+**Sharding by device, not round-robin.** The consumer has one poller thread
+and N worker threads (default 4, `WORKER_THREADS` env var). A naive
+thread-pool fan-out would destroy per-device ordering, so instead each
+event is routed by `hash(device_id) % N` to a fixed worker — every device's
+events always land on the same worker, in arrival order, while different
+devices process in parallel. Each worker owns its own `pqxx::connection`;
+libpqxx connections aren't thread-safe, so sharing one across workers would
+be a data race.
 
-```
-docker exec -it consumepulse-kafka /opt/kafka/bin/kafka-console-consumer.sh --bootstrap-server localhost:9092 --topic device-events --from-beginning
-```
+**Bounded queues for backpressure.** The channel between the poller and
+each worker is a fixed-capacity blocking queue
+([bounded_queue.hpp](consumer/src/bounded_queue.hpp)). If a worker is stuck
+retrying a dead database, its queue fills up and `push()` blocks — the
+poller naturally slows down instead of buffering an unbounded backlog in
+memory.
 
-## Phase 2 — Consumer skeleton
+**A watermark, not "commit whatever finished last."** With four workers
+finishing out of order, message 100 can complete before message 97. Naively
+committing offset 100 would let a crash-and-restart skip 97 — silent data
+loss. [offset_tracker.hpp](consumer/src/offset_tracker.hpp) tracks, per
+partition, the highest contiguous run of completed offsets and only ever
+exposes that as safe to commit. With 97 outstanding and 98–100 done, it
+commits nothing; the moment 97 lands, it jumps straight to 100. This is
+also why every write has to be idempotent — anything redelivered above the
+watermark after a crash needs to be harmless, not just retried.
 
-C++ service connects to Kafka, subscribes to `device-events` as consumer
-group `telemetry-processors`, and prints each raw message (partition,
-offset, key, payload). No parsing or persistence yet — that's Phase 3.
+**Idempotent writes, everywhere.** `events.event_id` and
+`alerts (event_id, rule_name)` both carry unique constraints, and every
+insert is `ON CONFLICT ... DO NOTHING`. This is what actually prevents
+duplicate processing on redelivery — not the transport. (Earlier version of
+this had a real bug here: the `alerts` table had no constraint at all, so a
+crash between the alert write and the offset commit could double-insert an
+alert on replay. `events` was protected the whole time; `alerts` wasn't. Now
+both are.)
 
-Requires: CMake, a C++17 toolchain (MSVC or g++), and vcpkg (manifest mode
-pulls in `librdkafka` automatically).
+**Commit after the write, not before — and batched.** `enable.auto.commit`
+is off. Offsets commit only once a message's DB write has actually
+succeeded, via the watermark above, batched on a 500ms timer rather than
+per message (a `commitSync()` is a blocking broker round-trip; doing it per
+event caps throughput in the low hundreds/sec no matter how fast everything
+else is). The wider redelivery window on crash is fine specifically because
+writes are idempotent — that property is what pays for this optimization.
 
-```
-cmake -S consumer -B consumer/build -DCMAKE_TOOLCHAIN_FILE=%VCPKG_ROOT%/scripts/buildsystems/vcpkg.cmake
-cmake --build consumer/build --config Release
-```
+**Poison pills vs. transient failures, handled differently.** A message
+that fails to parse as JSON will never parse no matter how many times it's
+retried, so it's logged and its offset commits immediately — no point
+blocking the partition on it forever. A database write failure is assumed
+transient (a restart, a network blip): it's logged, the connection is
+rebuilt, and the *same* message is retried until it succeeds. The consumer
+never advances past a message it couldn't persist.
 
-Run it (with the producer running in another terminal):
+## Patterns, and why
 
-```
-./consumer/build/Release/consumer.exe
-```
+| Pattern | Where | Why |
+|---|---|---|
+| Factory | [device_factory.hpp](consumer/src/device_factory.hpp) | `DeviceHandlerFactory::create(device_type)` — a new device type is a new handler class, nothing existing changes. |
+| Strategy | [anomaly_strategy.hpp](consumer/src/anomaly_strategy.hpp) | `ThresholdStrategy` behind `IAnomalyStrategy` — detection rule is swappable per metric without touching the caller. |
+| Observer | [alert_observer.hpp](consumer/src/alert_observer.hpp) | `AlertPublisher` fans an alert out to `ConsoleAlertObserver` and `DbAlertObserver`. Detection doesn't know or care who's listening. |
+| Repository | [repository.hpp](consumer/src/repository.hpp) | Business logic depends on `IEventRepository`/`IAlertRepository`, not on libpqxx directly — dependency inversion, and it's what makes the fake-repository unit test possible. |
 
-**Alternative: Docker.** If the native binary won't run (e.g. Windows Smart
-App Control blocking a freshly-built, unsigned `.exe`), build/run it in a
-container instead — same `vcpkg.json`/`CMakeLists.txt`, just a Linux target
-via `consumer/Dockerfile`:
+## Tech stack
 
-```
-docker compose --profile consumer run --rm consumer
-```
+| Layer | Choice |
+|---|---|
+| Broker | Apache Kafka, KRaft mode (no Zookeeper) |
+| Producer | Python, `confluent-kafka` |
+| Consumer | C++17, `librdkafka`, `libpqxx` 7.x, `nlohmann-json`, `std::thread` |
+| Database | PostgreSQL 16 |
+| Build | CMake + vcpkg (manifest mode) |
+| Tests | Catch2, run automatically as part of the Docker build |
+| Orchestration | docker-compose |
 
-It joins the compose network and talks to Kafka at `kafka:29092`
-(overridable via the `KAFKA_BOOTSTRAP_SERVERS` env var; native runs default
-to `localhost:9092`). Not started by `docker compose up` by default — it's
-behind the `consumer` profile.
-
-Verify: printed output matches what `simulate_devices.py` sent.
-
-## Phase 3 — Parsing + Repository
-
-Each Kafka message is parsed into an `Event` struct and persisted via
-`PostgresEventRepository::save()`. Idempotent: `event_id` has a UNIQUE
-constraint, and `save()` does `INSERT ... ON CONFLICT (event_id) DO NOTHING`,
-so redelivery of the same message never creates a duplicate row. The device
-carried in each event (`device_id` + `device_type`) is upserted into
-`devices` first, satisfying the FK on `events.device_id` — there's no
-separate seeding step.
-
-Rebuild (adds `nlohmann-json` + `libpqxx` to the vcpkg manifest):
-
-```
-cmake -S consumer -B consumer/build -DCMAKE_TOOLCHAIN_FILE=%VCPKG_ROOT%/scripts/buildsystems/vcpkg.cmake
-cmake --build consumer/build --config Release
-```
-
-or via Docker: `docker compose --profile consumer run --rm consumer`
-(`PG_CONN_STRING` env var, defaults to `postgresql://consumepulse:consumepulse@localhost:5432/consumepulse`
-natively, wired to the `postgres` service in compose).
-
-Verify:
-
-```
-make events
-```
-
-To prove idempotency, redeliver everything and confirm row count doesn't move:
-
-```
-docker exec -it consumepulse-kafka /opt/kafka/bin/kafka-consumer-groups.sh --bootstrap-server localhost:9092 --group telemetry-processors --reset-offsets --to-earliest --topic device-events --execute
-```
-
-then rerun the consumer and re-check `SELECT count(*) FROM events` — same
-number as before, and `count(*) = count(DISTINCT event_id)`.
-
-## Phase 4 — Factory + Strategy
-
-`DeviceHandlerFactory::create(device_type)` returns a handler
-(`AppServerHandler` / `SensorHubHandler`) that owns a `ThresholdStrategy` per
-metric. Ranges match the producer's normal random-walk range exactly, so the
-producer's occasional spikes are guaranteed to trip a threshold:
-
-| device type  | metric         | range      |
-|--------------|----------------|------------|
-| app-server   | `cpu_temp`     | 40 – 75    |
-| app-server   | `latency_ms`   | 20 – 150   |
-| sensor-hub   | `cpu_temp`     | 20 – 45    |
-| sensor-hub   | `humidity_pct` | 30 – 70    |
-
-No persistence yet — an out-of-range reading just logs an `[ALERT]` line.
-Phase 5 adds the Observer pattern and writes it to the `alerts` table.
-
-Rebuild and run the same way as Phase 3 (`make consumer-build` /
-`make consumer`, or the native CMake commands above).
-
-Verify: with the producer running, watch consumer output for lines like
+## Quickstart
 
 ```
-[ALERT] critical threshold device=app-server-1: cpu_temp=98 outside expected range [40, 75] for device app-server-1
+docker compose --profile all up -d --build
 ```
 
-## Phase 5 — Observer + alert persistence
-
-`AlertPublisher` fans an alert out to attached `IAlertObserver`s —
-`ConsoleAlertObserver` (the `[ALERT]` log line) and `DbAlertObserver`
-(`PostgresAlertRepository::save()`, writing to the `alerts` table). Detection
-in `ThresholdStrategy` doesn't know or care who's listening.
-
-Rebuild and run the same way as Phase 3/4.
-
-Verify: with the producer running, watch for `[ALERT]` lines, then
+Brings up Kafka, Postgres, the producer, and the consumer in one command.
+Or bring pieces up individually:
 
 ```
-make query
+docker compose up -d                       # Kafka + Postgres only
+docker compose --profile producer up -d --build
+docker compose --profile consumer up -d --build
 ```
 
-and confirm the rows match what was logged.
+Useful `make` targets: `up`, `all`, `down`, `psql`, `events` (recent
+`events` rows), `query` (recent `alerts` rows), `consumer-build`,
+`consumer`.
 
-## Phase 6 — Commit discipline + error handling
+`WORKER_THREADS` (default 4) and `PG_CONN_STRING` /
+`KAFKA_BOOTSTRAP_SERVERS` are configurable via environment variables on the
+`consumer` service.
 
-`enable.auto.commit` is now `false`. The offset for a message is committed
-(`consumer->commitSync(msg.get())`) only after its event has been saved and
-any alert published — never before. Two failure modes are handled
-differently:
+## Running the tests
 
-- **Malformed JSON** (poison pill): logged and the offset is committed
-  anyway — retrying a message that will never parse doesn't help, and this
-  keeps one bad message from blocking the partition forever.
-- **DB write failure** (connection drop, Postgres restart): logged, offset
-  left uncommitted, connection rebuilt, and the *same* message retried in a
-  loop (with a 2s backoff) until it succeeds. The consumer never advances
-  past a message it couldn't persist.
+```
+docker compose --profile consumer build consumer
+```
 
-Verify: start the producer and consumer, then kill the DB mid-run and watch
-it recover.
+`ctest` runs as part of the image build — a failing test fails the build,
+not just a separate CI step that's easy to ignore. Covers `ThresholdStrategy`
+(including that its range boundaries are inclusive), `DeviceHandlerFactory`'s
+unknown-device-type path, and the event-processing path end-to-end against a
+fake `IEventRepository` — no database required for any of it.
+
+## Failure-mode demos
+
+These are the parts I'd actually walk someone through.
+
+**Idempotent redelivery.** Force Kafka to redeliver everything already
+processed and confirm nothing duplicates:
+
+```
+docker exec -it consumepulse-kafka /opt/kafka/bin/kafka-consumer-groups.sh \
+  --bootstrap-server localhost:9092 --group telemetry-processors \
+  --reset-offsets --to-earliest --topic device-events --execute
+```
+
+Rerun the consumer, then check both tables — row counts stay flat, and
+`count(*) = count(DISTINCT event_id)` for `events`,
+`count(*) = count(DISTINCT (event_id, rule_name))` for `alerts`.
+
+**Kill the database mid-stream.** With the producer and consumer running:
 
 ```
 docker stop consumepulse-postgres
 ```
 
-Consumer logs show `DB write failed, offset not committed, retrying`
-repeatedly, and
-
-```
-docker exec -it consumepulse-kafka /opt/kafka/bin/kafka-consumer-groups.sh --bootstrap-server localhost:9092 --group telemetry-processors --describe
-```
-
-shows `CURRENT-OFFSET` frozen while `LOG-END-OFFSET`/`LAG` keep climbing.
-Then:
+Every worker logs `DB write failed, offset not committed, retrying` and
+keeps retrying — no crash. `kafka-consumer-groups --describe` shows
+`CURRENT-OFFSET` frozen at the lowest in-flight offset across all workers
+while `LOG-END-OFFSET` keeps climbing. Bring it back:
 
 ```
 docker start consumepulse-postgres
 ```
 
-and the consumer catches back up to zero lag with no message skipped or
+and the consumer catches up to zero lag with no message lost or
 duplicated.
 
-**Known tradeoff:** while stuck retrying a single message, the consumer
-isn't calling `consume()`, so a DB outage long enough to exceed
-`session.timeout.ms` could trigger a group rebalance. Fine for a demo-scale
-outage; a production version would heartbeat manually during long retries.
+## Throughput
+
+Single-threaded vs. the default 4 workers, draining a 5,000-message burst
+(6 devices, all containers on one host — AMD Ryzen 7 6800H, 8c/16t, via
+Docker Desktop/WSL2):
+
+| Workers | Time | Throughput |
+|---|---|---|
+| 1 | 19.5s | ~257 events/sec |
+| 4 | 10.9s | ~458 events/sec |
+
+Not a clean 4x — with only 6 simulated devices, sharding parallelism is
+capped well before 4 workers saturate, and every worker still round-trips
+the same single Postgres instance. More devices would show a bigger gap.
+
+## Known limitations
+
+- **Event + alert writes aren't atomically linked.** They're two separate
+  transactions. The idempotency constraints make redelivery safe, but the
+  cleaner fix would be threading a single `pqxx::work` through both writes
+  so they commit together — removing the window instead of just making it
+  harmless on retry. Didn't get to it here.
+- **No rebalance listener.** The watermark tracker assumes one consumer
+  instance owns all partitions for the run. A second instance joining the
+  group mid-run isn't handled — that'd need a rebalance callback to reset
+  tracker state per partition.
+- **A DB outage long enough to exceed `session.timeout.ms`** could trigger
+  a rebalance while a worker is blocked retrying, since that worker isn't
+  polling during the retry. Fine at demo scale; a production version would
+  heartbeat manually during long retries.
+- One Postgres connection per worker, no pooling — fine at this scale, not
+  how I'd do it past a handful of workers.
+
+## What's next
+
+- Thread the event/alert writes into one transaction.
+- A second `IEventRepository` implementation behind the same interface —
+  the abstraction exists specifically so a new sink is a drop-in, not a
+  rewrite.
+- A rebalance listener so the multi-instance case is actually handled, not
+  just untested.

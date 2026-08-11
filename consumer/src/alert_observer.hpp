@@ -1,8 +1,10 @@
 #pragma once
 
 #include <iostream>
+#include <sstream>
 #include <vector>
 
+#include "log.hpp"
 #include "models.hpp"
 #include "repository.hpp"
 
@@ -17,8 +19,10 @@ public:
 class ConsoleAlertObserver : public IAlertObserver {
 public:
     void onAlert(const Alert& alert) override {
-        std::cout << "[ALERT] " << alert.severity << " " << alert.rule_name
-                  << " device=" << alert.device_id << ": " << alert.message << "\n";
+        std::ostringstream line;
+        line << "[ALERT] " << alert.severity << " " << alert.rule_name
+             << " device=" << alert.device_id << ": " << alert.message;
+        logLine(std::cout, line.str());
     }
 };
 

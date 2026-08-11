@@ -5,7 +5,8 @@
   "dependencies": [
     "librdkafka",
     "nlohmann-json",
-    "libpqxx"
+    "libpqxx",
+    "catch2"
   ],
   "overrides": [
     { "name": "libpqxx", "version": "7.10.5" }

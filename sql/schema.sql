@@ -23,6 +23,10 @@ CREATE TABLE alerts (
     rule_name       TEXT NOT NULL,
     severity        TEXT NOT NULL,
     message         TEXT NOT NULL,
-    created_at      TIMESTAMPTZ DEFAULT now()
+    created_at      TIMESTAMPTZ DEFAULT now(),
+    -- one alert per (event, rule): redelivery must no-op here the same way
+    -- it does for events, or a crash between the alert commit and the
+    -- offset commit produces a duplicate alert on replay.
+    UNIQUE (event_id, rule_name)
 );
 CREATE INDEX idx_alerts_device_time ON alerts(device_id, created_at);

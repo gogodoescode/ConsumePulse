@@ -50,12 +50,15 @@ class PostgresAlertRepository : public IAlertRepository {
 public:
     explicit PostgresAlertRepository(pqxx::connection& conn) : conn_(conn) {}
 
+    // Idempotent on (event_id, rule_name): redelivery after a crash between
+    // this commit and the offset commit must not double-insert the alert.
     void save(const Alert& alert) override {
         pqxx::work txn(conn_);
 
         txn.exec_params(
             "INSERT INTO alerts (event_id, device_id, rule_name, severity, message) "
-            "VALUES ($1, $2, $3, $4, $5)",
+            "VALUES ($1, $2, $3, $4, $5) "
+            "ON CONFLICT (event_id, rule_name) DO NOTHING",
             alert.event_id, alert.device_id, alert.rule_name, alert.severity, alert.message);
 
         txn.commit();
