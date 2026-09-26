@@ -156,8 +156,15 @@ docker compose --profile consumer build consumer
 `ctest` runs as part of the image build — a failing test fails the build,
 not just a separate CI step that's easy to ignore. Covers `ThresholdStrategy`
 (including that its range boundaries are inclusive), `DeviceHandlerFactory`'s
-unknown-device-type path, and the event-processing path end-to-end against a
-fake `IEventRepository` — no database required for any of it.
+unknown-device-type path, the event-processing path end-to-end against a
+fake `IEventRepository` (no database required), and — the one that actually
+matters — `OffsetTracker`'s contiguous-prefix watermark: stalls on the
+oldest outstanding offset, collapses correctly once it lands, never
+double-advances on a duplicate or stale completion, tracks partitions
+independently, and a 200-trial randomized-completion-order property test
+asserting the committed watermark never exceeds the true contiguous prefix.
+That's the logic where a bug would mean silent data loss on restart with no
+error anywhere, so it gets the most scrutiny.
 
 ## Failure-mode demos
 

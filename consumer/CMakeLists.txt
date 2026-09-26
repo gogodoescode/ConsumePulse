@@ -21,6 +21,7 @@ if(BUILD_TESTS)
         tests/test_anomaly_strategy.cpp
         tests/test_device_factory.cpp
         tests/test_event_processor.cpp
+        tests/test_offset_tracker.cpp
     )
     target_link_libraries(consumer_tests PRIVATE Catch2::Catch2WithMain nlohmann_json::nlohmann_json
                                                   libpqxx::pqxx)
