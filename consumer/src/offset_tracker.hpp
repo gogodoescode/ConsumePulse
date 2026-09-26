@@ -55,8 +55,8 @@ public:
     }
 
 private:
-    std::mutex mutex_;
-    std::map<int32_t, int64_t> nextExpected_;
-    std::map<int32_t, std::set<int64_t>> outOfOrder_;
-    std::map<int32_t, int64_t> lastCommitted_;
+    std::mutex mutex_;           // protects all the maps below
+    std::map<int32_t, int64_t> nextExpected_;        // lowest offset not yet completed, per partition
+    std::map<int32_t, std::set<int64_t>> outOfOrder_;     // offsets we've seen but can't fold into the watermark yet
+    std::map<int32_t, int64_t> lastCommitted_;       // the last offset we returned for each partition
 };

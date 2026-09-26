@@ -5,3 +5,4 @@ producer/venv/
 *.pyc
 .vscode/
 ConsumePulse_Build_Guide.md
+build/
