@@ -203,18 +203,38 @@ duplicated.
 
 ## Throughput
 
-Single-threaded vs. the default 4 workers, draining a 5,000-message burst
-(6 devices, all containers on one host — AMD Ryzen 7 6800H, 8c/16t, via
-Docker Desktop/WSL2):
+Draining a 6,000-event backlog, events spread evenly across devices. Time
+is `max(ingested_at) - min(ingested_at)` in Postgres, so consumer startup
+and group join aren't counted. All containers on one host (AMD Ryzen 7
+6800H, 8c/16t, Docker Desktop/WSL2); each row is the mean of 2 runs.
+Reproduce with `bench/bench.sh <devices> <workers> <events>`.
 
-| Workers | Time | Throughput |
-|---|---|---|
-| 1 | 19.5s | ~257 events/sec |
-| 4 | 10.9s | ~458 events/sec |
+| Workers | 6 devices | Speedup | 60 devices | Speedup |
+|---|---|---|---|---|
+| 1 | 438/s | 1.0× | 442/s | 1.0× |
+| 2 | 616/s | 1.4× | 642/s | 1.5× |
+| 3 | 530/s | 1.2× | 1,102/s | 2.5× |
+| 4 | 622/s | 1.4× | 1,101/s | 2.5× |
 
-Not a clean 4x — with only 6 simulated devices, sharding parallelism is
-capped well before 4 workers saturate, and every worker still round-trips
-the same single Postgres instance. More devices would show a bigger gap.
+**Why 6 devices barely scale: shard skew.** With 4 workers,
+`std::hash(device_id) % 4` puts 4 of the 6 devices on one worker and
+none on another (per-worker counts: 4,000 / 1,000 / 1,000 / 0). The
+busiest worker does two-thirds of the work, so the ceiling is 1.5×, and
+the measured 1.4× sits right under it.
+
+**Why 3 workers is slower than 2: partition skew plus head-of-line
+blocking.** The 6 keys also land unevenly on Kafka's 3 partitions (4 / 2 /
+0), and the poller drains a backlog roughly one partition at a time. While
+it reads partition 1, one worker has 3,000 of its events and another has
+1,000; the poller blocks pushing into the full queue while the other
+worker idles. Modeling time as the busiest worker's load within each
+partition phase predicts every 6-device row within ~6%.
+
+**Confirming it:** the same run with 60 devices (a 14 / 20 / 10 / 16
+device split at 4 workers) reaches 2.5×. The remaining gap to the 3.0×
+load ceiling is shared cost I haven't isolated yet: one Postgres server
+behind all four connections, the single poller thread, and a global log
+mutex every event passes through.
 
 ## Known limitations
 
